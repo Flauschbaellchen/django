@@ -1,13 +1,14 @@
 import logging
 import sys
-import tempfile
+import asyncio
 import traceback
 
 from asgiref.sync import ThreadSensitiveContext, sync_to_async
+from a2wsgi.wsgi import Body as A2WSGIBody
 
 from django.conf import settings
 from django.core import signals
-from django.core.exceptions import RequestAborted, RequestDataTooBig
+from django.core.exceptions import RequestDataTooBig
 from django.core.handlers import base
 from django.http import (
     FileResponse,
@@ -34,7 +35,7 @@ class ASGIRequest(HttpRequest):
     # body and aborts.
     body_receive_timeout = 60
 
-    def __init__(self, scope, body_file):
+    def __init__(self, scope, asgi_stream):
         self.scope = scope
         self._post_parse_error = False
         self._read_started = False
@@ -96,8 +97,7 @@ class ASGIRequest(HttpRequest):
             self.META[corrected_name] = value
         # Pull out request encoding, if provided.
         self._set_content_type_params(self.META)
-        # Directly assign the body file to be our stream.
-        self._stream = body_file
+        self._stream = asgi_stream
         # Other bits.
         self.resolver_match = None
 
@@ -158,18 +158,17 @@ class ASGIHandler(base.BaseHandler):
         """
         Handles the ASGI request. Called via the __call__ method.
         """
-        # Receive the HTTP request body as a stream object.
-        try:
-            body_file = await self.read_body(receive)
-        except RequestAborted:
-            return
-        # Request is complete and can be served.
         set_script_prefix(self.get_script_prefix(scope))
         await sync_to_async(signals.request_started.send, thread_sensitive=True)(
             sender=self.__class__, scope=scope
         )
+        # Wrap the ASGI input stream to provide #read and #readlines
+        # As the underlying code is synchronous and aspects a (Byte-)stream,
+        # we would otherwise need to cache it in a temporary file
+        # resulting in additional writes/reads.
+        asgi_stream = A2WSGIBody(asyncio.get_event_loop(), receive)
         # Get the request and check for basic issues.
-        request, error_response = self.create_request(scope, body_file)
+        request, error_response = self.create_request(scope, asgi_stream)
         if request is None:
             await self.send_response(error_response, send)
             return
@@ -183,33 +182,13 @@ class ASGIHandler(base.BaseHandler):
         # Send the response.
         await self.send_response(response, send)
 
-    async def read_body(self, receive):
-        """Reads an HTTP body from an ASGI connection."""
-        # Use the tempfile that auto rolls-over to a disk file as it fills up.
-        body_file = tempfile.SpooledTemporaryFile(
-            max_size=settings.FILE_UPLOAD_MAX_MEMORY_SIZE, mode="w+b"
-        )
-        while True:
-            message = await receive()
-            if message["type"] == "http.disconnect":
-                # Early client disconnect.
-                raise RequestAborted()
-            # Add a body chunk from the message, if provided.
-            if "body" in message:
-                body_file.write(message["body"])
-            # Quit out if that's the end.
-            if not message.get("more_body", False):
-                break
-        body_file.seek(0)
-        return body_file
-
-    def create_request(self, scope, body_file):
+    def create_request(self, scope, receive):
         """
         Create the Request object and returns either (request, None) or
         (None, response) if there is an error response.
         """
         try:
-            return self.request_class(scope, body_file), None
+            return self.request_class(scope, receive), None
         except UnicodeDecodeError:
             logger.warning(
                 "Bad Request (UnicodeDecodeError)",
