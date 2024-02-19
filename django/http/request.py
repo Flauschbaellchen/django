@@ -342,8 +342,7 @@ class HttpRequest:
                 self._body = self.read()
             except OSError as e:
                 raise UnreadablePostError(*e.args) from e
-            finally:
-                self._stream.close()
+
             self._stream = BytesIO(self._body)
         return self._body
 
